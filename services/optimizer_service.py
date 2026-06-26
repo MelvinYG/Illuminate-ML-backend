@@ -1,146 +1,191 @@
+"""
+Mixed-integer optimizer for any number of user-supplied devices.
+Each device has: name, power rating (kW), planned daily run hours,
+priority (low/normal/high) and optional preferred time window.
+"""
 import pulp
 from loguru import logger
+from typing import List, Dict, Optional
 
-# Mode configs — how each mode changes optimizer behaviour
 MODE_CONFIG = {
     "self_consumption": {
-        "grid_buy_penalty": 2.0,      # Penalise buying from grid heavily
+        "grid_buy_penalty": 2.0,
         "battery_drain_allowed": True,
         "appliances_active": True,
-        "description": "Prioritise solar and battery over grid"
+        "description": "Prioritise solar and battery over grid",
     },
     "tou_savings": {
-        "grid_buy_penalty": 1.0,      # Default — just follow tariffs
+        "grid_buy_penalty": 1.0,
         "battery_drain_allowed": True,
         "appliances_active": True,
-        "description": "Optimise based on time-of-use tariff rates"
+        "description": "Optimise based on time-of-use tariff rates",
     },
     "full_backup": {
-        "grid_buy_penalty": 0.5,      # Allow grid buying to keep battery full
-        "battery_drain_allowed": False, # Never drain battery
+        "grid_buy_penalty": 0.5,
+        "battery_drain_allowed": False,
         "appliances_active": True,
-        "description": "Keep battery fully charged at all times"
+        "description": "Keep battery fully charged at all times",
     },
     "low_power": {
         "grid_buy_penalty": 1.0,
         "battery_drain_allowed": True,
-        "appliances_active": False,   # Don't run heavy appliances
-        "description": "Minimise heavy appliance usage"
-    }
+        "appliances_active": False,
+        "description": "Minimise heavy appliance usage",
+    },
 }
+
+PRIORITY_WEIGHT = {"high": 0.0, "normal": 0.1, "low": 0.5}
+
+
+def _fmt_hour(h: Optional[int]) -> str:
+    if h is None:
+        return "Not scheduled"
+    suffix = "AM" if h < 12 else "PM"
+    twelve = 12 if h % 12 == 0 else h % 12
+    return f"{twelve} {suffix}"
+
+
+def _slugify(name: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in name.lower()).strip("_")
 
 
 def run_optimization(
-    tariffs: list,          # 24 hourly buying tariffs
-    solar_outputs: list,    # 24 hourly solar output
-    consumption: list,      # 24 hourly consumption
-    initial_battery: float, # Starting battery level in kWh
+    tariffs: List[float],
+    solar_outputs: List[float],
+    consumption: List[float],
+    initial_battery: float,
     battery_capacity: float = 15.0,
-    appliances: list = ["washing_machine", "dishwasher", "pump"],
-    mode: str = "tou_savings"   
-) -> dict:
+    devices: Optional[List[Dict]] = None,
+    mode: str = "tou_savings",
+) -> Dict:
     """
-    Runs PuLP linear programming optimizer.
-    Returns 24-hour optimal schedule.
+    devices: list of {
+        name, power_rating_kw, usage_hours (int, total hrs/day),
+        priority ("high"|"normal"|"low"),
+        earliest_hour (0-23, optional),
+        latest_hour  (0-23, optional, exclusive end),
+        contiguous (bool, default False) - must run in consecutive hours
+    }
     """
     config = MODE_CONFIG.get(mode, MODE_CONFIG["tou_savings"])
-    logger.info(f"Running optimizer in mode: {mode} — {config['description']}")
+    devices = devices or []
+    logger.info(f"Running optimizer in mode: {mode} — {config['description']} | {len(devices)} device(s)")
 
-    tariff_sell = [t - 1 for t in tariffs] # Sell at 1 less than buy price
-    penalty = config["grid_buy_penalty"]
-
+    tariff_sell = [t - 1 for t in tariffs]
     model = pulp.LpProblem("HEMS_Optimization", pulp.LpMinimize)
 
-    # Decision variables — binary for appliances
-    active_appliances = appliances if config["appliances_active"] else []
-    has_wm = "washing_machine" in active_appliances
-    has_dw = "dishwasher" in active_appliances
-    has_pump = "pump" in active_appliances
+    # --- Device decision variables ---------------------------------------
+    use_devices = config["appliances_active"] and len(devices) > 0
+    device_vars: Dict[str, List[pulp.LpVariable]] = {}
+    device_meta: Dict[str, Dict] = {}
 
-    x_wm   = [pulp.LpVariable(f"x_wm_{t}", cat="Binary") for t in range(24)]
-    x_dw   = [pulp.LpVariable(f"x_dw_{t}", cat="Binary") for t in range(24)]
-    x_pump = [pulp.LpVariable(f"x_pump_{t}", cat="Binary") for t in range(24)]
+    if use_devices:
+        for idx, d in enumerate(devices):
+            slug = f"{_slugify(d.get('name', f'dev{idx}'))}_{idx}"
+            x = [pulp.LpVariable(f"x_{slug}_{t}", cat="Binary") for t in range(24)]
+            device_vars[slug] = x
+            device_meta[slug] = d
 
-    battery_charge    = [pulp.LpVariable(f"bc_{t}", lowBound=0, upBound=3) for t in range(24)]
-    battery_discharge = [pulp.LpVariable(f"bd_{t}", lowBound=0,
-                          upBound=3 if config["battery_drain_allowed"] else 0)  # ← full_backup mode
-                         for t in range(24)]
-    battery_level     = [pulp.LpVariable(f"bl_{t}", lowBound=0, upBound=battery_capacity) for t in range(24)]
-    grid_buy          = [pulp.LpVariable(f"gb_{t}", lowBound=0) for t in range(24)]
-    grid_sell         = [pulp.LpVariable(f"gs_{t}", lowBound=0) for t in range(24)]
+    # --- Energy variables -------------------------------------------------
+    battery_charge = [pulp.LpVariable(f"bc_{t}", lowBound=0, upBound=3) for t in range(24)]
+    battery_discharge = [
+        pulp.LpVariable(
+            f"bd_{t}", lowBound=0,
+            upBound=3 if config["battery_drain_allowed"] else 0,
+        ) for t in range(24)
+    ]
+    battery_level = [pulp.LpVariable(f"bl_{t}", lowBound=0, upBound=battery_capacity) for t in range(24)]
+    grid_buy = [pulp.LpVariable(f"gb_{t}", lowBound=0) for t in range(24)]
+    grid_sell = [pulp.LpVariable(f"gs_{t}", lowBound=0) for t in range(24)]
 
-    # Objective — minimize grid cost
-    model += pulp.lpSum(
-        tariffs[t] * grid_buy[t] - tariff_sell[t] * grid_sell[t]
-        for t in range(24)
-    )
+    # --- Objective: minimise grid cost + priority weighting on device hours
+    grid_cost_terms = [tariffs[t] * grid_buy[t] - tariff_sell[t] * grid_sell[t] for t in range(24)]
+    priority_terms = []
+    for slug, x in device_vars.items():
+        d = device_meta[slug]
+        w = PRIORITY_WEIGHT.get(str(d.get("priority", "normal")).lower(), 0.1)
+        # high priority devices get small/zero penalty so they run as planned;
+        # low priority devices get penalty so optimiser may shift their hours.
+        priority_terms.extend(w * x[t] for t in range(24))
+    model += pulp.lpSum(grid_cost_terms) + pulp.lpSum(priority_terms)
 
-    # Constraints
+    # --- Power balance per hour ------------------------------------------
     for t in range(24):
-        # Power balance
+        device_load_t = pulp.lpSum(
+            float(device_meta[slug].get("power_rating_kw", 0.0)) * device_vars[slug][t]
+            for slug in device_vars
+        )
         model += (
-            1.5 * x_wm[t] + 1.2 * x_dw[t] + 1.0 * x_pump[t] + consumption[t]
-            <= grid_buy[t] - grid_sell[t] + battery_discharge[t] + solar_outputs[t] - battery_charge[t]
+            device_load_t + consumption[t]
+            <= grid_buy[t] - grid_sell[t] + battery_discharge[t]
+            + solar_outputs[t] - battery_charge[t]
         )
 
-        # Battery state
         if t == 0:
             model += battery_level[t] == initial_battery + battery_charge[t] - battery_discharge[t]
         else:
-            model += battery_level[t] == battery_level[t-1] + battery_charge[t] - battery_discharge[t]
+            model += battery_level[t] == battery_level[t - 1] + battery_charge[t] - battery_discharge[t]
 
-    # Appliance constraints
-    if has_wm:
-        model += pulp.lpSum(x_wm) == 1
-    else:
-        model += pulp.lpSum(x_wm) == 0
+    # --- Device constraints ----------------------------------------------
+    for slug, x in device_vars.items():
+        d = device_meta[slug]
+        hours = max(0, int(d.get("usage_hours", 1)))
+        model += pulp.lpSum(x) == hours
 
-    if has_dw:
-        model += pulp.lpSum(x_dw) == 2
-        for t in range(23):
-            model += x_dw[t] - x_dw[t+1] <= 0
-    else:
-        model += pulp.lpSum(x_dw) == 0
+        earliest = int(d.get("earliest_hour", 0) or 0)
+        latest = int(d.get("latest_hour", 24) or 24)
+        for t in range(24):
+            if t < earliest or t >= latest:
+                model += x[t] == 0
 
-    if has_pump:
-        model += pulp.lpSum(x_pump) == 1
-    else:
-        model += pulp.lpSum(x_pump) == 0
+        if d.get("contiguous"):
+            # Force consecutive run: x[t] - x[t+1] <= 0 then >=0 once block ends
+            # Simpler: require sum of |x[t+1]-x[t]| transitions <= 2 via binary z
+            # We'll approximate with: enforce monotonic block via z[t]
+            z = [pulp.LpVariable(f"z_{slug}_{t}", cat="Binary") for t in range(24)]
+            for t in range(23):
+                model += x[t + 1] - x[t] <= z[t + 1]
+            model += pulp.lpSum(z) <= 1
 
-    # Solve
-    model.solve(pulp.PULP_CBC_CMD(msg=False))   # msg=False = silent mode
+    # --- Solve ------------------------------------------------------------
+    model.solve(pulp.PULP_CBC_CMD(msg=False))
 
-    # Build result
+    # --- Build schedule ---------------------------------------------------
     schedule = []
     for t in range(24):
-        schedule.append({
+        row = {
             "hour": t,
-            "grid_buy_kw": round(max(0, pulp.value(grid_buy[t])), 3),
-            "grid_sell_kw": round(max(0, pulp.value(grid_sell[t])), 3),
-            "battery_level_kwh": round(pulp.value(battery_level[t]), 3),
+            "grid_buy_kw": round(max(0, pulp.value(grid_buy[t]) or 0), 3),
+            "grid_sell_kw": round(max(0, pulp.value(grid_sell[t]) or 0), 3),
+            "battery_level_kwh": round(pulp.value(battery_level[t]) or 0, 3),
             "solar_output_kw": round(solar_outputs[t], 3),
-            "run_washing_machine": bool(round(pulp.value(x_wm[t]))),
-            "run_dishwasher": bool(round(pulp.value(x_dw[t]))),
-            "run_pump": bool(round(pulp.value(x_pump[t])))
-        })
+            "devices": {},
+        }
+        for slug, x in device_vars.items():
+            row["devices"][device_meta[slug].get("name", slug)] = bool(round(pulp.value(x[t]) or 0))
+        schedule.append(row)
 
-    def fmt_hour(h):
-        if h is None: return "Not scheduled"
-        return f"{'12' if h == 12 else h % 12 or 12} {'AM' if h < 12 else 'PM'}"
-    
-    # Human readable recommendations
-    wm_hour = next((s["hour"] for s in schedule if s["run_washing_machine"]), None)
-    dw_hours = [s["hour"] for s in schedule if s["run_dishwasher"]]
-    pump_hour = next((s["hour"] for s in schedule if s["run_pump"]), None)
-
+    # --- Human-readable recommendations ----------------------------------
+    recommendations: Dict[str, str] = {}
+    for slug, x in device_vars.items():
+        name = device_meta[slug].get("name", slug)
+        hours_on = [t for t in range(24) if round(pulp.value(x[t]) or 0) == 1]
+        if not hours_on:
+            recommendations[name] = "Not scheduled"
+            continue
+        # contiguous block?
+        contiguous = all(hours_on[i] + 1 == hours_on[i + 1] for i in range(len(hours_on) - 1))
+        if contiguous and len(hours_on) > 1:
+            recommendations[name] = f"Run from {_fmt_hour(hours_on[0])} to {_fmt_hour(hours_on[-1] + 1)}"
+        elif len(hours_on) == 1:
+            recommendations[name] = f"Run at {_fmt_hour(hours_on[0])}"
+        else:
+            slots = ", ".join(_fmt_hour(h) for h in hours_on)
+            recommendations[name] = f"Run at: {slots}"
 
     return {
         "status": pulp.LpStatus[model.status],
-        "total_grid_cost": round(pulp.value(model.objective), 3),
-        "recommendations": {
-            "washing_machine": f"Run at {fmt_hour(wm_hour)}",
-            "dishwasher": f"Run at {fmt_hour(dw_hours[0])} - {fmt_hour(dw_hours[-1]+1)}" if dw_hours else "Not scheduled",
-            "pump": f"Run at {fmt_hour(pump_hour)}"
-        },
-        "hourly_schedule": schedule
+        "total_grid_cost": round(pulp.value(model.objective) or 0, 3),
+        "recommendations": recommendations,
+        "hourly_schedule": schedule,
     }

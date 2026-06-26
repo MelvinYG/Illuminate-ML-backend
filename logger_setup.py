@@ -95,6 +95,9 @@ def setup_logging():
     # Remove loguru's default handler
     logger.remove()
 
+    # Inject request_id="system" into all records that don't have one
+    logger.configure(extra={"request_id": "system"})
+
     # 1. Console — clean, coloured, readable
     logger.add(
         sys.stdout,
