@@ -11,7 +11,27 @@ load_dotenv()
 
 API_KEY = os.getenv("WEATHER_API_KEY")
 BASE_URL = os.getenv("WEATHER_API_BASE_URL")
-CACHE_TTL_MINUTES = 30  
+CACHE_TTL_MINUTES = 30
+
+
+def _mock_24h_weather() -> list:
+    """Synthetic 24h weather fallback when the upstream API is unavailable."""
+    hourly = []
+    for h in range(24):
+        # Solar peaks midday; UV index follows similar curve
+        if 6 <= h <= 18:
+            sun = max(0.0, 1.0 - abs(12 - h) / 6.0)
+        else:
+            sun = 0.0
+        hourly.append({
+            "hour": h,
+            "temp": 22 + sun * 12,
+            "humidity": 60 - sun * 25,
+            "cloud_cover": 30,
+            "solar_radiation": sun * 900,
+            "uv_index": sun * 10,
+        })
+    return hourly
 
 def fetch_weather(location: str, db: Session) -> list:
     """
@@ -33,6 +53,16 @@ def fetch_weather(location: str, db: Session) -> list:
     # Cache miss — hit the API
     logger.info(f"Weather cache MISS for {location} — fetching from API")
 
+    if not API_KEY or API_KEY == "demo_key" or not BASE_URL:
+        logger.warning("Weather API not configured — using synthetic mock data")
+        hourly = _mock_24h_weather()
+        try:
+            db.add(WeatherCache(location=location, data=hourly))
+            db.commit()
+        except Exception:
+            db.rollback()
+        return hourly
+
     url = f"{BASE_URL}/{location}/next24hours" 
 
     params = {
@@ -42,7 +72,13 @@ def fetch_weather(location: str, db: Session) -> list:
         "contentType": "json"
     }
 
-    response = requests.get(url, params=params)
+    try:
+        response = requests.get(url, params=params, timeout=10)
+    except Exception as e:
+        logger.error(f"Weather API request failed: {e}")
+        if cached:
+            return cached.data
+        return _mock_24h_weather()
 
     if response.status_code != 200:
         logger.error(f"Weather API failed with status {response.status_code}")
@@ -52,7 +88,8 @@ def fetch_weather(location: str, db: Session) -> list:
             logger.warning("Using stale weather cache as fallback")
             return cached.data
 
-        raise Exception(f"Weather API failed: {response.status_code}")
+        logger.warning("Using mock weather data as final fallback")
+        return _mock_24h_weather()
 
     data = response.json()
 
