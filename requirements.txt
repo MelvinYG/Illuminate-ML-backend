@@ -4,11 +4,14 @@ annotated-types==0.7.0
 anyio==4.14.1
 APScheduler==3.11.2
 asyncpg==0.31.0
+bcrypt==5.0.0
 boto3==1.43.36
 botocore==1.43.36
 certifi==2026.6.17
+cffi==2.0.0
 charset-normalizer==3.4.7
 click==8.4.2
+cryptography==49.0.0
 fastapi==0.138.0
 h11==0.16.0
 idna==3.18
@@ -26,8 +29,10 @@ polars==1.42.0
 polars-runtime-32==1.42.0
 psycopg2-binary==2.9.12
 PuLP==3.3.2
+pycparser==3.0
 pydantic==2.13.4
 pydantic_core==2.46.4
+PyJWT==2.13.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 requests==2.34.2
