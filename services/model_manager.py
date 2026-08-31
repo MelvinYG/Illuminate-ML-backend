@@ -329,8 +329,12 @@ def _load_prediction_logs_as_training(db: Session) -> pd.DataFrame:
 
 def _should_promote_new_model(db: Session, new_r2: float) -> bool:
     current_active = db.query(ModelVersion).filter(ModelVersion.is_active == True).first()
-    if not current_active:
+
+    # Treat as "no model" if DB says active but the file is actually missing
+    if current_active is None or not CURRENT_MODEL_PATH.exists():
+        logger.info("No valid active model on disk — promoting first trained model unconditionally")
         return True
+
     improvement = new_r2 - current_active.r2_score
     logger.info(
         f"Model comparison — current R²: {current_active.r2_score:.4f} vs new R²: {new_r2:.4f} "
